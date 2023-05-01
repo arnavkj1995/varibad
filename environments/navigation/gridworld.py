@@ -16,12 +16,13 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class GridNavi(gym.Env):
-    def __init__(self, num_cells=5, num_steps=15):
+    def __init__(self, num_cells=5, num_steps=15, expl=False):
         super(GridNavi, self).__init__()
 
         self.seed()
         self.num_cells = num_cells
         self.num_states = num_cells ** 2
+        self._expl = expl
 
         self._max_episode_steps = num_steps
         self.step_count = 0
@@ -52,11 +53,16 @@ class GridNavi(gym.Env):
         self._belief_state = self._reset_belief()
 
     def reset_task(self, task=None):
+        
         if task is None:
             self._goal = np.array(random.choice(self.possible_goals))
         else:
             self._goal = np.array(task)
+        
+        if self._expl:
+            self._goal = [-1, -1]
         self._reset_belief()
+        self._vis_freq = np.zeros(self.num_states)
         return self._goal
 
     def _reset_belief(self):
@@ -83,7 +89,8 @@ class GridNavi(gym.Env):
             self._belief_state = np.ceil(self._belief_state)
             self._belief_state /= sum(self._belief_state)
 
-        assert (1-sum(self._belief_state)) < 1e-4
+        if not self._expl:
+            assert (1-sum(self._belief_state)) < 1e-4
 
         return self._belief_state
 
@@ -93,9 +100,17 @@ class GridNavi(gym.Env):
     def get_belief(self):
         return self._belief_state.copy()
 
+    def get_onehot_state(self):
+        state_obs = np.zeros(self.num_states)
+        state_obs[int(self._env_state[0] * self.num_cells + self._env_state[1])] = 1
+        return state_obs
+
     def reset(self):
         self.step_count = 0
         self._env_state = np.array(self.starting_state)
+
+        self._vis_freq += self.get_onehot_state()
+        
         return self._env_state.copy()
 
     def state_transition(self, action):
@@ -138,12 +153,22 @@ class GridNavi(gym.Env):
 
         # update ground-truth belief
         self.update_belief(self._env_state, action)
+        self._vis_freq += self.get_onehot_state()
+        # if self._expl:
+        #     if not np.any(self._vis_freq == 0):
+        #         reward = 1.0
+        #     else:
+        #         reward = -0.1
 
         task = self.get_task()
         task_id = self.task_to_id(task)
         info = {'task': task,
                 'task_id': task_id,
                 'belief': self.get_belief()}
+        
+        if self._expl:
+            info['cov'] = np.count_nonzero(self._vis_freq) / (1. * self.num_states)
+            info['vis'] = self._vis_freq
         return state, reward, done, info
 
     def task_to_id(self, goals):
@@ -182,6 +207,383 @@ class GridNavi(gym.Env):
         if cl.dim() == 1:
             cl = cl.view(-1, 1)
         nb_digits = self.num_cells ** 2
+        # One hot encoding buffer that you create out of the loop and just keep reusing
+        y_onehot = torch.FloatTensor(pos.shape[0], nb_digits).to(device)
+        # In your for loop
+        y_onehot.zero_()
+        y_onehot.scatter_(1, cl, 1)
+        return y_onehot
+
+    def onehot_id_to_goal(self, pos):
+        if isinstance(pos, list):
+            pos = [self.id_to_task(p.argmax(dim=1)) for p in pos]
+        else:
+            pos = self.id_to_task(pos.argmax(dim=1))
+        return pos
+
+    @staticmethod
+    def visualise_behaviour(env,
+                            args,
+                            policy,
+                            iter_idx,
+                            encoder=None,
+                            reward_decoder=None,
+                            image_folder=None,
+                            **kwargs
+                            ):
+        """
+        Visualises the behaviour of the policy, together with the latent state and belief.
+        The environment passed to this method should be a SubProcVec or DummyVecEnv, not the raw env!
+        """
+
+        num_episodes = args.max_rollouts_per_task
+        unwrapped_env = env.venv.unwrapped.envs[0]
+
+        # --- initialise things we want to keep track of ---
+
+        episode_all_obs = [[] for _ in range(num_episodes)]
+        episode_prev_obs = [[] for _ in range(num_episodes)]
+        episode_next_obs = [[] for _ in range(num_episodes)]
+        episode_actions = [[] for _ in range(num_episodes)]
+        episode_rewards = [[] for _ in range(num_episodes)]
+
+        episode_returns = []
+        episode_lengths = []
+
+        episode_goals = []
+        if args.pass_belief_to_policy and (encoder is None):
+            episode_beliefs = [[] for _ in range(num_episodes)]
+        else:
+            episode_beliefs = None
+
+        if encoder is not None:
+            # keep track of latent spaces
+            episode_latent_samples = [[] for _ in range(num_episodes)]
+            episode_latent_means = [[] for _ in range(num_episodes)]
+            episode_latent_logvars = [[] for _ in range(num_episodes)]
+        else:
+            episode_latent_samples = episode_latent_means = episode_latent_logvars = None
+
+        curr_latent_sample = curr_latent_mean = curr_latent_logvar = None
+
+        # --- roll out policy ---
+
+        env.reset_task()
+        [state, belief, task] = utl.reset_env(env, args)
+        start_obs = state.clone()
+
+        for episode_idx in range(args.max_rollouts_per_task):
+
+            curr_goal = env.get_task()
+            curr_rollout_rew = []
+            curr_rollout_goal = []
+
+            if encoder is not None:
+
+                if episode_idx == 0:
+                    # reset to prior
+                    curr_latent_sample, curr_latent_mean, curr_latent_logvar, hidden_state = encoder.prior(1)
+                    curr_latent_sample = curr_latent_sample[0].to(device)
+                    curr_latent_mean = curr_latent_mean[0].to(device)
+                    curr_latent_logvar = curr_latent_logvar[0].to(device)
+
+                episode_latent_samples[episode_idx].append(curr_latent_sample[0].clone())
+                episode_latent_means[episode_idx].append(curr_latent_mean[0].clone())
+                episode_latent_logvars[episode_idx].append(curr_latent_logvar[0].clone())
+
+            episode_all_obs[episode_idx].append(start_obs.clone())
+            if args.pass_belief_to_policy and (encoder is None):
+                episode_beliefs[episode_idx].append(belief)
+
+            for step_idx in range(1, env._max_episode_steps + 1):
+
+                if step_idx == 1:
+                    episode_prev_obs[episode_idx].append(start_obs.clone())
+                else:
+                    episode_prev_obs[episode_idx].append(state.clone())
+
+                # act
+                _, action = utl.select_action(args=args,
+                                                 policy=policy,
+                                                 state=state.view(-1),
+                                                 belief=belief,
+                                                 task=task,
+                                                 deterministic=True,
+                                                 latent_sample=curr_latent_sample.view(-1) if (curr_latent_sample is not None) else None,
+                                                 latent_mean=curr_latent_mean.view(-1) if (curr_latent_mean is not None) else None,
+                                                 latent_logvar=curr_latent_logvar.view(-1) if (curr_latent_logvar is not None) else None,
+                                                 )
+
+                # observe reward and next obs
+                [state, belief, task], (rew_raw, rew_normalised), done, infos = utl.env_step(env, action, args)
+
+                if encoder is not None:
+                    # update task embedding
+                    curr_latent_sample, curr_latent_mean, curr_latent_logvar, hidden_state = encoder(
+                        action.float().to(device),
+                        state,
+                        rew_raw.reshape((1, 1)).float().to(device),
+                        hidden_state,
+                        return_prior=False)
+
+                    episode_latent_samples[episode_idx].append(curr_latent_sample[0].clone())
+                    episode_latent_means[episode_idx].append(curr_latent_mean[0].clone())
+                    episode_latent_logvars[episode_idx].append(curr_latent_logvar[0].clone())
+
+                episode_all_obs[episode_idx].append(state.clone())
+                episode_next_obs[episode_idx].append(state.clone())
+                episode_rewards[episode_idx].append(rew_raw.clone())
+                episode_actions[episode_idx].append(action.clone())
+
+                curr_rollout_rew.append(rew_raw.clone())
+                curr_rollout_goal.append(env.get_task().copy())
+
+                if args.pass_belief_to_policy and (encoder is None):
+                    episode_beliefs[episode_idx].append(belief)
+
+                if infos[0]['done_mdp'] and not done:
+                    start_obs = infos[0]['start_state']
+                    start_obs = torch.from_numpy(start_obs).float().reshape((1, -1)).to(device)
+                    break
+
+            episode_returns.append(sum(curr_rollout_rew))
+            episode_lengths.append(step_idx)
+            episode_goals.append(curr_goal)
+
+        # clean up
+
+        if encoder is not None:
+            episode_latent_means = [torch.stack(e) for e in episode_latent_means]
+            episode_latent_logvars = [torch.stack(e) for e in episode_latent_logvars]
+
+        episode_prev_obs = [torch.cat(e) for e in episode_prev_obs]
+        episode_next_obs = [torch.cat(e) for e in episode_next_obs]
+        episode_actions = [torch.cat(e) for e in episode_actions]
+        episode_rewards = [torch.cat(e) for e in episode_rewards]
+
+        # plot behaviour & visualise belief in env
+
+        rew_pred_means, rew_pred_vars = plot_bb(env, args, episode_all_obs, episode_goals, reward_decoder,
+                                                episode_latent_means, episode_latent_logvars,
+                                                image_folder, iter_idx, episode_beliefs)
+
+        if reward_decoder:
+            plot_rew_reconstruction(env, rew_pred_means, rew_pred_vars, image_folder, iter_idx)
+
+        return episode_latent_means, episode_latent_logvars, \
+               episode_prev_obs, episode_next_obs, episode_actions, episode_rewards, \
+               episode_returns
+
+class TwoRoomsNavi(gym.Env):
+    def __init__(self, num_cells=5, num_steps=15, expl=False):
+        super(TwoRoomsNavi, self).__init__()
+
+        self.seed()
+        self.num_cells = num_cells
+        self.height = 3
+        self.width = 9
+        self.num_states = self.height * self.width
+        self._expl = expl
+
+        self._max_episode_steps = num_steps
+        self.step_count = 0
+
+        self.observation_space = spaces.Box(low=np.array([0, 0]), high=np.array([self.height -1, self.width - 1]), shape=(2,))
+        self.action_space = spaces.Discrete(5)  # noop, up, right, down, left
+        self.task_dim = 2
+        self.belief_dim = 25
+
+        # possible starting states
+        self.starting_state = (1.0, 4.0)
+
+        self.walls = []
+        self.walls.append((0, 4))
+        self.walls.append((2, 4))
+
+        # goals can be anywhere except on possible starting states and immediately around it
+        self.possible_goals = []
+        for i in range(self.height):
+            for j in range(self.width):
+                self.possible_goals.append((i, j))
+        self.possible_goals.remove((1, 4))
+        self.possible_goals.remove((1, 5))
+        self.possible_goals.remove((1, 3))
+        # self.possible_goals.remove((1, 0))
+        for w in self.walls:
+            self.possible_goals.remove(w)
+
+        self.task_dim = 2
+        self.num_tasks = self.num_states
+
+        # reset the environment state
+        self._env_state = np.array(self.starting_state)
+        # reset the goal
+        self._goal = self.reset_task()
+        # reset the belief
+        self._belief_state = self._reset_belief()
+
+    def reset_task(self, task=None):    
+        if task is None:
+            self._goal = np.array(random.choice(self.possible_goals))
+        else:
+            self._goal = np.array(task)
+        
+        if self._expl:
+            self._goal = [-1, -1]
+
+        self._reset_belief()
+        return self._goal
+
+    def _reset_belief(self):
+        self._belief_state = np.zeros((self.num_states))
+        for pg in self.possible_goals:
+            idx = self.task_to_id(np.array(pg))
+            self._belief_state[idx] = 1.0 / len(self.possible_goals)
+        
+        return self._belief_state
+
+    def update_belief(self, state, action):
+
+        on_goal = state[0] == self._goal[0] and state[1] == self._goal[1]
+
+        # hint
+        if action == 5 or on_goal:
+            possible_goals = self.possible_goals.copy()
+            possible_goals.remove(tuple(self._goal))
+            wrong_hint = possible_goals[random.choice(range(len(possible_goals)))]
+            self._belief_state *= 0
+            self._belief_state[self.task_to_id(self._goal)] = 0.5
+            self._belief_state[self.task_to_id(wrong_hint)] = 0.5
+        else:
+            self._belief_state[self.task_to_id(state)] = 0
+            self._belief_state = np.ceil(self._belief_state)
+            self._belief_state /= sum(self._belief_state)
+
+        assert (1-sum(self._belief_state)) < 1e-4
+
+        return self._belief_state
+
+    def get_task(self):
+        return self._goal.copy()
+
+    def get_belief(self):
+        return self._belief_state.copy()
+
+    def get_onehot_state(self):
+        state_obs = np.zeros(self.num_states)
+        state_obs[int(self._env_state[0] * self.width + self._env_state[1])] = 1
+        return state_obs
+
+    def reset(self):
+        self.step_count = 0
+        self._env_state = np.array(self.starting_state)
+        
+        self._vis_freq = self.get_onehot_state()
+        for pg in self.walls:
+            self._vis_freq[int(pg[0] * self.width + pg[1])] = 1
+        
+        return self._env_state.copy()
+
+    def state_transition(self, action):
+        """
+        Moving the agent between states
+        """
+        new_state = self._env_state.copy()
+        if action == 1:  # up
+            new_state[0] = max([self._env_state[0] - 1, 0])
+        elif action == 2:  # right
+            new_state[1] = min([self._env_state[1] + 1, self.width - 1])
+        elif action == 3:  # down
+            new_state[0] = min([self._env_state[0] + 1, self.height - 1])
+        elif action == 4:  # left
+            new_state[1] = max([self._env_state[1] - 1, 0])
+
+        # FIXME: Collision with the wall
+        for w in self.walls:
+            if w[0] == new_state[0] and w[1] == new_state[1]:
+                return self._env_state
+
+        self._env_state = new_state
+        return self._env_state
+
+    def step(self, action):
+
+        if isinstance(action, np.ndarray) and action.ndim == 1:
+            action = action[0]
+        assert self.action_space.contains(action)
+
+        done = False
+
+        # perform state transition
+        state = self.state_transition(action)
+
+        # check if maximum step limit is reached
+        self.step_count += 1
+        if self.step_count >= self._max_episode_steps:
+            done = True
+
+        # compute reward
+        if self._env_state[0] == self._goal[0] and self._env_state[1] == self._goal[1]:
+            reward = 1.0
+        else:
+            reward = -0.1
+
+        # update ground-truth belief
+        self.update_belief(self._env_state, action)
+        self._vis_freq += self.get_onehot_state()
+        # if self._expl:
+        #     if not np.any(self._vis_freq == 0):
+        #         reward = 1.0
+        #     else:
+        #         reward = -0.1
+
+        task = self.get_task()
+        task_id = self.task_to_id(task)
+        info = {'task': task,
+                'task_id': task_id,
+                'belief': self.get_belief()}
+        
+        if self._expl:
+            info['cov'] = np.count_nonzero(self._vis_freq) / (1. * self.num_states)
+            info['vis'] = self._vis_freq
+        return state, reward, done, info
+
+    def task_to_id(self, goals):
+        mat = torch.arange(0, self.num_states).long().reshape((self.height, self.width))
+        if isinstance(goals, list) or isinstance(goals, tuple):
+            goals = np.array(goals)
+        if isinstance(goals, np.ndarray):
+            goals = torch.from_numpy(goals)
+        goals = goals.long()
+
+        if goals.dim() == 1:
+            goals = goals.unsqueeze(0)
+
+        goal_shape = goals.shape
+        if len(goal_shape) > 2:
+            goals = goals.reshape(-1, goals.shape[-1])
+
+        classes = mat[goals[:, 0], goals[:, 1]]
+        classes = classes.reshape(goal_shape[:-1])
+
+        return classes
+
+    def id_to_task(self, classes):
+        mat = torch.arange(0, self.num_states).long().reshape((self.height, self.width)).numpy()
+        goals = np.zeros((len(classes), 2))
+        classes = classes.numpy()
+        for i in range(len(classes)):
+            pos = np.where(classes[i] == mat)
+            goals[i, 0] = float(pos[0][0])
+            goals[i, 1] = float(pos[1][0])
+        goals = torch.from_numpy(goals).to(device).float()
+        return goals
+
+    def goal_to_onehot_id(self, pos):
+        cl = self.task_to_id(pos)
+        if cl.dim() == 1:
+            cl = cl.view(-1, 1)
+        nb_digits = self.num_states
         # One hot encoding buffer that you create out of the loop and just keep reusing
         y_onehot = torch.FloatTensor(pos.shape[0], nb_digits).to(device)
         # In your for loop
