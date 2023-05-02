@@ -402,6 +402,14 @@ class MetaLearner:
                                                     iter_idx=self.iter_idx,
                                                     tasks=self.train_tasks,
                                                     )
+            
+            first_rewsv2 = utl_eval.evaluate_firstrewardtimev2(args=self.args,
+                                                    policy=self.policy,
+                                                    ret_rms=ret_rms,
+                                                    encoder=self.vae.encoder,
+                                                    iter_idx=self.iter_idx,
+                                                    tasks=self.train_tasks,
+                                                    )
 
             comp_times = utl_eval.evaluate_searchtime(args=self.args,
                                                     policy=self.policy,
@@ -410,9 +418,18 @@ class MetaLearner:
                                                     iter_idx=self.iter_idx,
                                                     tasks=self.train_tasks,
                                                     )
+            
+            comp_timesv2 = utl_eval.evaluate_searchtimev2(args=self.args,
+                                                    policy=self.policy,
+                                                    ret_rms=ret_rms,
+                                                    encoder=self.vae.encoder,
+                                                    iter_idx=self.iter_idx,
+                                                    tasks=self.train_tasks,
+                                                    )
 
             with open(self.args.log_file, 'a') as f: #'logs' + self.args.log_seed + '.txt', 'a') as f:
-                f.write(str((self.iter_idx + 1) * self.args.policy_num_steps) + "," + ",".join([str(x) for x in first_rews]) + "," + ",".join([str(x) for x in comp_times]) + "\n")
+                f.write(str((self.iter_idx + 1) * self.args.policy_num_steps * self.args.num_processes) + "," + ",".join([str(x) for x in first_rews]) + "," + ",".join([str(x) for x in first_rewsv2]) + "," + ",".join([str(x) for x in comp_times]) + "," + ",".join([str(x) for x in first_rews]) + "\n")
+
             # log the return avg/std across tasks (=processes)
             returns_avg = returns_per_episode.mean(dim=0)
             returns_std = returns_per_episode.std(dim=0)

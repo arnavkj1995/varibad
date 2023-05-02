@@ -60,7 +60,9 @@ class GridNavi(gym.Env):
             self._goal = np.array(task)
         
         if self._expl:
+            # print (" Goal is set to [-1., -1]")
             self._goal = [-1, -1]
+
         self._reset_belief()
         self._vis_freq = np.zeros(self.num_states)
         return self._goal
@@ -150,6 +152,9 @@ class GridNavi(gym.Env):
             reward = 1.0
         else:
             reward = -0.1
+
+        # if self._expl:
+        #     print (reward, self._goal, state, self._vis_freq)
 
         # update ground-truth belief
         self.update_belief(self._env_state, action)
